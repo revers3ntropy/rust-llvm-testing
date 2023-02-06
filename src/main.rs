@@ -1,25 +1,18 @@
 use inkwell::OptimizationLevel;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
-use inkwell::execution_engine::{ExecutionEngine, JitFunction};
 use inkwell::module::Module;
 use std::error::Error;
-
-/// Convenience type alias for the `sum` function.
-///
-/// Calling this is innately `unsafe` because there's no guarantee it doesn't
-/// do `unsafe` operations internally.
-type SumFunc = unsafe extern "C" fn(u64, u64, u64) -> u64;
+use inkwell::targets::{CodeModel, RelocMode, Target, TargetMachine};
 
 struct CodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
-    builder: Builder<'ctx>,
-    execution_engine: ExecutionEngine<'ctx>,
+    builder: Builder<'ctx>
 }
 
 impl<'ctx> CodeGen<'ctx> {
-    fn jit_compile_sum(&self) -> Option<JitFunction<SumFunc>> {
+    fn compile_sum(&self) -> Result<String, Box<dyn Error>> {
         let i64_type = self.context.i64_type();
         let fn_type = i64_type.fn_type(&[i64_type.into(), i64_type.into(), i64_type.into()], false);
         let function = self.module.add_function("sum", fn_type, None);
@@ -27,43 +20,50 @@ impl<'ctx> CodeGen<'ctx> {
 
         self.builder.position_at_end(basic_block);
 
-        let x = function.get_nth_param(0)?.into_int_value();
-        let y = function.get_nth_param(1)?.into_int_value();
-        let z = function.get_nth_param(2)?.into_int_value();
+        let x = function.get_nth_param(0).unwrap().into_int_value();
+        let y = function.get_nth_param(1).unwrap().into_int_value();
+        let z = function.get_nth_param(2).unwrap().into_int_value();
 
         let sum = self.builder.build_int_add(x, y, "sum");
         let sum = self.builder.build_int_add(sum, z, "sum");
 
         self.builder.build_return(Some(&sum));
 
-        unsafe { self.execution_engine.get_function("sum").ok() }
+        Target::initialize_x86(&Default::default());
+
+        println!("Target: {}", TargetMachine::get_default_triple());
+
+        let target = Target::from_triple(&TargetMachine::get_default_triple()).unwrap();
+        let target_machine = target
+            .create_target_machine(
+                &TargetMachine::get_default_triple(),
+                "generic",
+                "",
+                OptimizationLevel::Aggressive,
+                RelocMode::Default,
+                CodeModel::Default
+            ).unwrap();
+
+        let res = target_machine.write_to_memory_buffer(
+            &self.module,
+            inkwell::targets::FileType::Assembly
+        )?;
+
+        Ok(String::from_utf8_lossy(res.as_slice()).parse().unwrap())
     }
 }
-
-// when the kids don't understand, make it bigger!
-
 
 fn main() -> Result<(), Box<dyn Error>> {
     let context = Context::create();
     let module = context.create_module("sum");
-    let execution_engine = module.create_jit_execution_engine(OptimizationLevel::None)?;
     let codegen = CodeGen {
         context: &context,
         module,
         builder: context.create_builder(),
-        execution_engine,
     };
 
-    let sum = codegen.jit_compile_sum().ok_or("Unable to JIT compile `sum`")?;
-
-    let x = 1u64;
-    let y = 2u64;
-    let z = 3u64;
-
-    unsafe {
-        println!("{} + {} + {} = {}", x, y, z, sum.call(x, y, z));
-        assert_eq!(sum.call(x, y, z), x + y + z);
-    }
+    let res = codegen.compile_sum()?;
+    println!("{res}");
 
     Ok(())
 }
